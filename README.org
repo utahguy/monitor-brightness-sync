@@ -1,0 +1,77 @@
+#+TITLE: monitor-brightness-sync
+#+DESCRIPTION: Sync laptop brightness keys to external monitors via DDC/CI
+
+* Overview
+
+A lightweight daemon that watches your laptop's backlight for changes (triggered by keyboard brightness keys) and applies the same brightness percentage to all connected external monitors using DDC/CI.
+
+- Pure bash — no Python or extra runtimes
+- Uses =inotifywait= to react to kernel backlight changes with minimal overhead
+- Controls external monitors via =ddcutil= (DDC/CI over I2C)
+- Runs as a systemd user service
+
+* Dependencies
+
+- =ddcutil= — DDC/CI control for external monitors
+- =inotify-tools= — provides =inotifywait= for filesystem event monitoring
+- =i2c-dev= kernel module
+
+* Installation
+
+#+begin_src sh
+./install.sh
+#+end_src
+
+Then *log out and back in* for =i2c= group membership to take effect.
+
+* Usage
+
+** One-shot (apply current laptop brightness to external monitors)
+
+#+begin_src sh
+monitor-brightness-sync --once
+#+end_src
+
+** Dry run (see what would happen without changing anything)
+
+#+begin_src sh
+monitor-brightness-sync --once --dry-run
+#+end_src
+
+** Start the daemon via systemd
+
+#+begin_src sh
+systemctl --user enable --now monitor-brightness-sync
+#+end_src
+
+** Check status and logs
+
+#+begin_src sh
+systemctl --user status monitor-brightness-sync
+journalctl --user -u monitor-brightness-sync -f
+#+end_src
+
+* Configuration
+
+Edit the variables at the top of =monitor-brightness-sync=:
+
+| Variable            | Default | Description                                  |
+|---------------------+---------+----------------------------------------------|
+| =MIN_BRIGHTNESS=    |       0 | Floor for external monitor brightness (0-100) |
+| =MAX_BRIGHTNESS=    |     100 | Cap for external monitor brightness (0-100)   |
+| =MONITOR_CACHE_TTL= |      60 | Seconds to cache monitor detection results     |
+
+* How it works
+
+1. The kernel writes to =/sys/class/backlight/*/brightness= when brightness keys are pressed.
+2. =inotifywait= detects the file modification.
+3. The script reads the new value, converts it to a percentage of =max_brightness=.
+4. =ddcutil setvcp 0x10 <pct>= is called for each detected external monitor.
+
+Rapid key-hold events are coalesced to avoid hammering =ddcutil=. Monitor detection results are cached so hotplug is picked up without restarting the service.
+
+* Troubleshooting
+
+- *No monitors detected:* Ensure =i2c-dev= is loaded (=sudo modprobe i2c-dev=) and your user is in the =i2c= group (=groups | grep i2c=). Some monitors don't support DDC/CI — check with =ddcutil detect=.
+- *Permission denied:* Log out and back in after installation so the =i2c= group membership takes effect.
+- *Slow response:* DDC/CI is inherently slow (~50-100ms per command). The script runs =ddcutil= calls in parallel across monitors to minimize this.

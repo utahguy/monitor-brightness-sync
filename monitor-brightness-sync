@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+#
+# monitor-brightness-sync — Sync laptop brightness keys to external monitors via DDC/CI
+#
+# Dependencies: ddcutil, inotify-tools
+# Install:      sudo apt install ddcutil inotify-tools
+#
+# Usage:        monitor-brightness-sync [--once] [--dry-run]
+#   --once      Apply current brightness and exit (no daemon loop)
+#   --dry-run   Print what would happen without changing anything
+
+set -euo pipefail
+
+# --- Configuration -----------------------------------------------------------
+# DDC/CI brightness VCP code
+VCP_BRIGHTNESS=0x10
+
+# Minimum brightness floor for external monitors (0-100)
+MIN_BRIGHTNESS=0
+
+# Maximum brightness cap for external monitors (0-100)
+MAX_BRIGHTNESS=100
+
+# Seconds to cache the monitor detection result
+MONITOR_CACHE_TTL=60
+
+# Path to ddcutil
+DDCUTIL="${DDCUTIL:-ddcutil}"
+
+# --- Globals -----------------------------------------------------------------
+BACKLIGHT_DIR=""
+BACKLIGHT_MAX=""
+MONITOR_BUSES=()
+MONITOR_CACHE_TIME=0
+DRY_RUN=false
+ONCE=false
+
+# --- Functions ---------------------------------------------------------------
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}
+
+die() {
+    log "ERROR: $*" >&2
+    exit 1
+}
+
+check_deps() {
+    for cmd in "$DDCUTIL" inotifywait; do
+        if ! command -v "$cmd" &>/dev/null; then
+            die "'$cmd' not found. Install with: sudo apt install ${cmd/ddcutil/ddcutil}${cmd/inotifywait/inotify-tools}"
+        fi
+    done
+}
+
+find_backlight() {
+    local dir
+    for dir in /sys/class/backlight/*/; do
+        if [[ -f "${dir}brightness" && -f "${dir}max_brightness" ]]; then
+            BACKLIGHT_DIR="$dir"
+            BACKLIGHT_MAX=$(cat "${dir}max_brightness")
+            log "Backlight: ${dir} (max=${BACKLIGHT_MAX})"
+            return 0
+        fi
+    done
+    die "No backlight device found in /sys/class/backlight/"
+}
+
+detect_monitors() {
+    local now
+    now=$(date +%s)
+
+    # Use cached result if fresh enough
+    if (( ${#MONITOR_BUSES[@]} > 0 && now - MONITOR_CACHE_TIME < MONITOR_CACHE_TTL )); then
+        return 0
+    fi
+
+    MONITOR_BUSES=()
+    MONITOR_CACHE_TIME=$now
+
+    log "Detecting external monitors..."
+
+    # ddcutil detect lists monitors with their I2C bus numbers
+    local detect_output candidate_buses bus
+    detect_output=$("$DDCUTIL" detect --terse 2>/dev/null) || true
+
+    candidate_buses=()
+    while IFS= read -r line; do
+        if [[ "$line" =~ I2C\ bus:.*i2c-([0-9]+) ]]; then
+            candidate_buses+=("${BASH_REMATCH[1]}")
+        fi
+    done <<< "$detect_output"
+
+    # Verify each candidate supports DDC/CI read AND write for brightness
+    for bus in "${candidate_buses[@]}"; do
+        local cur_val
+        cur_val=$("$DDCUTIL" getvcp "$VCP_BRIGHTNESS" --bus "$bus" --terse 2>/dev/null) || {
+            log "Skipping bus i2c-${bus} (DDC/CI read failed)"
+            continue
+        }
+        # --terse output: "VCP 10 C 35 100" — current value is field 4
+        local cur_pct
+        cur_pct=$(echo "$cur_val" | awk '{print $4}')
+        if [[ -z "$cur_pct" ]]; then
+            log "Skipping bus i2c-${bus} (unexpected getvcp output)"
+            continue
+        fi
+        # Write back the same value to verify write path works
+        if ! "$DDCUTIL" setvcp "$VCP_BRIGHTNESS" "$cur_pct" --bus "$bus" --noverify 2>/dev/null; then
+            log "Skipping bus i2c-${bus} (DDC/CI write failed)"
+            continue
+        fi
+        MONITOR_BUSES+=("$bus")
+    done
+
+    if (( ${#MONITOR_BUSES[@]} == 0 )); then
+        log "No external DDC/CI monitors detected"
+    else
+        log "Found ${#MONITOR_BUSES[@]} external monitor(s) on bus(es): ${MONITOR_BUSES[*]}"
+    fi
+}
+
+get_laptop_brightness_pct() {
+    local cur
+    cur=$(cat "${BACKLIGHT_DIR}brightness")
+    echo $(( cur * 100 / BACKLIGHT_MAX ))
+}
+
+clamp() {
+    local val=$1
+    (( val < MIN_BRIGHTNESS )) && val=$MIN_BRIGHTNESS
+    (( val > MAX_BRIGHTNESS )) && val=$MAX_BRIGHTNESS
+    echo "$val"
+}
+
+set_monitor_brightness() {
+    local pct
+    pct=$(clamp "$1")
+
+    detect_monitors
+
+    if (( ${#MONITOR_BUSES[@]} == 0 )); then
+        return 0
+    fi
+
+    for bus in "${MONITOR_BUSES[@]}"; do
+        if $DRY_RUN; then
+            log "[dry-run] Would set bus i2c-${bus} brightness to ${pct}%"
+        else
+            log "Setting bus i2c-${bus} brightness to ${pct}%"
+            if ! "$DDCUTIL" setvcp "$VCP_BRIGHTNESS" "$pct" --bus "$bus" --noverify 2>/dev/null; then
+                # DDC/CI can be flaky — retry once after a brief pause
+                sleep 0.2
+                "$DDCUTIL" setvcp "$VCP_BRIGHTNESS" "$pct" --bus "$bus" --noverify 2>/dev/null \
+                    || log "WARNING: Failed to set brightness on bus i2c-${bus}"
+            fi
+            # Brief pause between monitors to avoid I2C bus contention
+            sleep 0.1
+        fi
+    done
+}
+
+sync_brightness() {
+    local pct
+    pct=$(get_laptop_brightness_pct)
+    log "Laptop brightness: ${pct}%"
+    set_monitor_brightness "$pct"
+}
+
+run_daemon() {
+    log "Starting brightness sync daemon"
+    log "Watching: ${BACKLIGHT_DIR}brightness"
+
+    # Initial sync
+    sync_brightness
+
+    # Watch for brightness file changes (written by the kernel on key press)
+    inotifywait -m -e modify "${BACKLIGHT_DIR}brightness" --format '%e' 2>/dev/null |
+    while read -r _event; do
+        # Coalesce rapid events (holding the key down)
+        sleep 0.05
+        # Drain any queued events
+        while read -r -t 0.01 _; do :; done
+        sync_brightness
+    done
+}
+
+cleanup() {
+    log "Shutting down"
+    # Kill any lingering ddcutil processes we spawned
+    jobs -p | xargs -r kill 2>/dev/null || true
+    exit 0
+}
+
+# --- Main --------------------------------------------------------------------
+
+main() {
+    while (( $# > 0 )); do
+        case "$1" in
+            --once)    ONCE=true ;;
+            --dry-run) DRY_RUN=true ;;
+            --help|-h)
+                echo "Usage: $(basename "$0") [--once] [--dry-run]"
+                echo ""
+                echo "Syncs laptop brightness to external monitors via DDC/CI."
+                echo ""
+                echo "Options:"
+                echo "  --once      Apply current brightness and exit"
+                echo "  --dry-run   Print actions without changing monitor brightness"
+                echo "  -h, --help  Show this help"
+                exit 0
+                ;;
+            *) die "Unknown option: $1" ;;
+        esac
+        shift
+    done
+
+    check_deps
+    find_backlight
+
+    if $ONCE; then
+        sync_brightness
+    else
+        trap cleanup SIGINT SIGTERM
+        run_daemon
+    fi
+}
+
+main "$@"

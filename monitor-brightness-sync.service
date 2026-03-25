@@ -1,0 +1,13 @@
+[Unit]
+Description=Sync laptop brightness keys to external monitors via DDC/CI
+Documentation=https://github.com/utahguy/monitor-brightness-sync
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/monitor-brightness-sync
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
