@@ -24,8 +24,8 @@ MAX_BRIGHTNESS=100
 # Seconds to cache the monitor detection result
 MONITOR_CACHE_TTL=60
 
-# Path to ddcutil
-DDCUTIL="${DDCUTIL:-ddcutil}"
+# Path to ddcutil (hardcoded to prevent command injection via environment)
+DDCUTIL="ddcutil"
 
 # --- Globals -----------------------------------------------------------------
 BACKLIGHT_DIR=""
