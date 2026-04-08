@@ -15,14 +15,16 @@ set -euo pipefail
 # DDC/CI brightness VCP code
 VCP_BRIGHTNESS=0x10
 
-# Minimum brightness floor for external monitors (0-100)
-MIN_BRIGHTNESS=0
-
-# Maximum brightness cap for external monitors (0-100)
-MAX_BRIGHTNESS=100
+# Default VCP range for uncalibrated monitors (standard DDC/CI)
+DEFAULT_MIN_VCP=0
+DEFAULT_MAX_VCP=100
 
 # Seconds to cache the monitor detection result
 MONITOR_CACHE_TTL=60
+
+# Per-monitor calibration config file
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/monitor-brightness-sync"
+CONFIG_FILE="${CONFIG_DIR}/monitors.conf"
 
 # Path to ddcutil (hardcoded to prevent command injection via environment)
 DDCUTIL="ddcutil"
@@ -31,9 +33,15 @@ DDCUTIL="ddcutil"
 BACKLIGHT_DIR=""
 BACKLIGHT_MAX=""
 MONITOR_BUSES=()
+MONITOR_IDS=()
 MONITOR_CACHE_TIME=0
 DRY_RUN=false
 ONCE=false
+CALIBRATE=false
+
+# Associative arrays for per-monitor VCP ranges (keyed by monitor ID)
+declare -A MONITOR_MIN_VCP
+declare -A MONITOR_MAX_VCP
 
 # --- Functions ---------------------------------------------------------------
 
@@ -52,6 +60,51 @@ check_deps() {
             die "'$cmd' not found. Install with: sudo apt install ${cmd/ddcutil/ddcutil}${cmd/inotifywait/inotify-tools}"
         fi
     done
+}
+
+load_monitor_config() {
+    [[ -f "$CONFIG_FILE" ]] || return 0
+    while IFS= read -r line; do
+        # Skip comments and blank lines
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// /}" ]] && continue
+        local id min_vcp max_vcp
+        read -r id min_vcp max_vcp <<< "$line"
+        if [[ -n "$id" && -n "$min_vcp" && -n "$max_vcp" ]]; then
+            MONITOR_MIN_VCP["$id"]=$min_vcp
+            MONITOR_MAX_VCP["$id"]=$max_vcp
+        fi
+    done < "$CONFIG_FILE"
+}
+
+save_monitor_config() {
+    local id=$1 min_vcp=$2 max_vcp=$3
+    mkdir -p "$CONFIG_DIR"
+    # Remove existing entry for this monitor if present
+    if [[ -f "$CONFIG_FILE" ]]; then
+        local tmp
+        tmp=$(grep -v "^${id} " "$CONFIG_FILE" 2>/dev/null) || true
+        echo "$tmp" > "$CONFIG_FILE"
+    fi
+    # Append new entry
+    echo "${id} ${min_vcp} ${max_vcp}" >> "$CONFIG_FILE"
+    # Update in-memory state
+    MONITOR_MIN_VCP["$id"]=$min_vcp
+    MONITOR_MAX_VCP["$id"]=$max_vcp
+    log "Saved calibration for ${id}: min_vcp=${min_vcp} max_vcp=${max_vcp}"
+}
+
+get_monitor_vcp_range() {
+    local id=$1
+    local min_vcp=${MONITOR_MIN_VCP["$id"]:-$DEFAULT_MIN_VCP}
+    local max_vcp=${MONITOR_MAX_VCP["$id"]:-$DEFAULT_MAX_VCP}
+    echo "$min_vcp $max_vcp"
+}
+
+scale_brightness() {
+    local pct=$1 min_vcp=$2 max_vcp=$3
+    # Scale laptop 0-100% to min_vcp-max_vcp range
+    echo $(( min_vcp + (max_vcp - min_vcp) * pct / 100 ))
 }
 
 find_backlight() {
@@ -77,23 +130,44 @@ detect_monitors() {
     fi
 
     MONITOR_BUSES=()
+    MONITOR_IDS=()
     MONITOR_CACHE_TIME=$now
 
     log "Detecting external monitors..."
 
-    # ddcutil detect lists monitors with their I2C bus numbers
-    local detect_output candidate_buses bus
+    # ddcutil detect lists monitors with their I2C bus numbers and identifiers
+    local detect_output
     detect_output=$("$DDCUTIL" detect --terse 2>/dev/null) || true
 
-    candidate_buses=()
+    # Parse bus numbers and monitor IDs from detect output
+    local candidate_buses=() candidate_ids=()
+    local current_bus="" current_id=""
     while IFS= read -r line; do
         if [[ "$line" =~ I2C\ bus:.*i2c-([0-9]+) ]]; then
-            candidate_buses+=("${BASH_REMATCH[1]}")
+            current_bus="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ Monitor:\ +(.+) ]]; then
+            current_id="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^$ && -n "$current_bus" ]]; then
+            # End of a display block
+            if [[ -n "$current_id" ]]; then
+                candidate_buses+=("$current_bus")
+                candidate_ids+=("$current_id")
+            fi
+            current_bus=""
+            current_id=""
         fi
     done <<< "$detect_output"
+    # Capture last block
+    if [[ -n "$current_bus" && -n "$current_id" ]]; then
+        candidate_buses+=("$current_bus")
+        candidate_ids+=("$current_id")
+    fi
 
     # Verify each candidate supports DDC/CI read AND write for brightness
-    for bus in "${candidate_buses[@]}"; do
+    local i
+    for i in "${!candidate_buses[@]}"; do
+        local bus="${candidate_buses[$i]}"
+        local id="${candidate_ids[$i]}"
         local cur_val
         cur_val=$("$DDCUTIL" getvcp "$VCP_BRIGHTNESS" --bus "$bus" --terse 2>/dev/null) || {
             log "Skipping bus i2c-${bus} (DDC/CI read failed)"
@@ -112,6 +186,7 @@ detect_monitors() {
             continue
         fi
         MONITOR_BUSES+=("$bus")
+        MONITOR_IDS+=("$id")
     done
 
     if (( ${#MONITOR_BUSES[@]} == 0 )); then
@@ -127,16 +202,8 @@ get_laptop_brightness_pct() {
     echo $(( cur * 100 / BACKLIGHT_MAX ))
 }
 
-clamp() {
-    local val=$1
-    (( val < MIN_BRIGHTNESS )) && val=$MIN_BRIGHTNESS
-    (( val > MAX_BRIGHTNESS )) && val=$MAX_BRIGHTNESS
-    echo "$val"
-}
-
 set_monitor_brightness() {
-    local pct
-    pct=$(clamp "$1")
+    local laptop_pct=$1
 
     detect_monitors
 
@@ -144,15 +211,22 @@ set_monitor_brightness() {
         return 0
     fi
 
-    for bus in "${MONITOR_BUSES[@]}"; do
+    local i
+    for i in "${!MONITOR_BUSES[@]}"; do
+        local bus="${MONITOR_BUSES[$i]}"
+        local id="${MONITOR_IDS[$i]}"
+        local min_vcp max_vcp vcp_val
+        read -r min_vcp max_vcp <<< "$(get_monitor_vcp_range "$id")"
+        vcp_val=$(scale_brightness "$laptop_pct" "$min_vcp" "$max_vcp")
+
         if $DRY_RUN; then
-            log "[dry-run] Would set bus i2c-${bus} brightness to ${pct}%"
+            log "[dry-run] Would set ${id} (bus i2c-${bus}) VCP to ${vcp_val} (laptop ${laptop_pct}%, range ${min_vcp}-${max_vcp})"
         else
-            log "Setting bus i2c-${bus} brightness to ${pct}%"
-            if ! "$DDCUTIL" setvcp "$VCP_BRIGHTNESS" "$pct" --bus "$bus" --noverify 2>/dev/null; then
+            log "Setting ${id} (bus i2c-${bus}) VCP to ${vcp_val} (laptop ${laptop_pct}%)"
+            if ! "$DDCUTIL" setvcp "$VCP_BRIGHTNESS" "$vcp_val" --bus "$bus" --noverify 2>/dev/null; then
                 # DDC/CI can be flaky — retry once after a brief pause
                 sleep 0.2
-                "$DDCUTIL" setvcp "$VCP_BRIGHTNESS" "$pct" --bus "$bus" --noverify 2>/dev/null \
+                "$DDCUTIL" setvcp "$VCP_BRIGHTNESS" "$vcp_val" --bus "$bus" --noverify 2>/dev/null \
                     || log "WARNING: Failed to set brightness on bus i2c-${bus}"
             fi
             # Brief pause between monitors to avoid I2C bus contention
@@ -166,6 +240,108 @@ sync_brightness() {
     pct=$(get_laptop_brightness_pct)
     log "Laptop brightness: ${pct}%"
     set_monitor_brightness "$pct"
+}
+
+calibrate_monitor() {
+    local bus=$1 id=$2
+
+    echo ""
+    echo "=== Calibrating: ${id} (bus i2c-${bus}) ==="
+    echo "This will set VCP brightness values and ask you to read the monitor's OSD."
+    echo "Use the monitor's physical brightness button to bring up the OSD after each step."
+    echo ""
+
+    # Find max_vcp: the VCP value where OSD reads 100
+    echo "--- Finding maximum VCP (OSD = 100) ---"
+    local lo=0 hi=100 mid osd_val
+    while (( hi - lo > 1 )); do
+        mid=$(( (lo + hi) / 2 ))
+        "$DDCUTIL" setvcp "$VCP_BRIGHTNESS" "$mid" --bus "$bus" --noverify &>/dev/null
+        sleep 1
+        echo ""
+        read -rp "VCP set to ${mid}. What does the monitor OSD show? " osd_val
+        if (( osd_val >= 100 )); then
+            hi=$mid
+        else
+            lo=$mid
+        fi
+    done
+    # Verify hi gives OSD >= 100
+    "$DDCUTIL" setvcp "$VCP_BRIGHTNESS" "$hi" --bus "$bus" --noverify &>/dev/null
+    sleep 1
+    echo ""
+    read -rp "VCP set to ${hi}. What does the OSD show? (should be ~100) " osd_val
+    local max_vcp=$hi
+    if (( osd_val < 100 )); then
+        echo "OSD still below 100 at VCP ${hi}. Using VCP 100 as max."
+        max_vcp=100
+    fi
+    echo "Max VCP: ${max_vcp}"
+
+    # Find min_vcp: the VCP value where OSD reads 0
+    echo ""
+    echo "--- Finding minimum VCP (OSD = 0) ---"
+    "$DDCUTIL" setvcp "$VCP_BRIGHTNESS" 0 --bus "$bus" --noverify &>/dev/null
+    sleep 1
+    echo ""
+    read -rp "VCP set to 0. What does the monitor OSD show? " osd_val
+    local min_vcp=0
+    if (( osd_val <= 0 )); then
+        echo "Min VCP: 0"
+    else
+        echo "OSD shows ${osd_val} at VCP 0. Monitor floor is above 0 — using VCP 0 as min."
+        echo "(The monitor cannot go dimmer than this via DDC/CI.)"
+        min_vcp=0
+    fi
+
+    # Restore to a comfortable brightness
+    local restore=$(( max_vcp / 2 ))
+    "$DDCUTIL" setvcp "$VCP_BRIGHTNESS" "$restore" --bus "$bus" --noverify &>/dev/null
+
+    echo ""
+    echo "Calibration result: ${id} — VCP range ${min_vcp}-${max_vcp}"
+    read -rp "Save this calibration? [Y/n] " confirm
+    if [[ "${confirm,,}" != "n" ]]; then
+        save_monitor_config "$id" "$min_vcp" "$max_vcp"
+    else
+        echo "Calibration discarded."
+    fi
+}
+
+run_calibration() {
+    check_deps
+    load_monitor_config
+
+    # Force fresh detection
+    MONITOR_CACHE_TIME=0
+    detect_monitors
+
+    if (( ${#MONITOR_BUSES[@]} == 0 )); then
+        die "No external monitors detected. Cannot calibrate."
+    fi
+
+    echo "Detected ${#MONITOR_BUSES[@]} monitor(s):"
+    local i
+    for i in "${!MONITOR_BUSES[@]}"; do
+        local id="${MONITOR_IDS[$i]}"
+        local status="uncalibrated"
+        if [[ -n "${MONITOR_MAX_VCP[$id]:-}" ]]; then
+            status="calibrated (VCP ${MONITOR_MIN_VCP[$id]}-${MONITOR_MAX_VCP[$id]})"
+        fi
+        echo "  ${i}: ${id} (bus i2c-${MONITOR_BUSES[$i]}) — ${status}"
+    done
+
+    for i in "${!MONITOR_BUSES[@]}"; do
+        local id="${MONITOR_IDS[$i]}"
+        if [[ -n "${MONITOR_MAX_VCP[$id]:-}" ]]; then
+            read -rp "Re-calibrate ${id}? [y/N] " recal
+            [[ "${recal,,}" == "y" ]] || continue
+        fi
+        calibrate_monitor "${MONITOR_BUSES[$i]}" "$id"
+    done
+
+    echo ""
+    echo "Calibration complete. Config saved to: ${CONFIG_FILE}"
 }
 
 run_daemon() {
@@ -198,17 +374,19 @@ cleanup() {
 main() {
     while (( $# > 0 )); do
         case "$1" in
-            --once)    ONCE=true ;;
-            --dry-run) DRY_RUN=true ;;
+            --once)      ONCE=true ;;
+            --dry-run)   DRY_RUN=true ;;
+            --calibrate) CALIBRATE=true ;;
             --help|-h)
-                echo "Usage: $(basename "$0") [--once] [--dry-run]"
+                echo "Usage: $(basename "$0") [--once] [--dry-run] [--calibrate]"
                 echo ""
                 echo "Syncs laptop brightness to external monitors via DDC/CI."
                 echo ""
                 echo "Options:"
-                echo "  --once      Apply current brightness and exit"
-                echo "  --dry-run   Print actions without changing monitor brightness"
-                echo "  -h, --help  Show this help"
+                echo "  --once        Apply current brightness and exit"
+                echo "  --dry-run     Print actions without changing monitor brightness"
+                echo "  --calibrate   Interactively calibrate VCP range for connected monitors"
+                echo "  -h, --help    Show this help"
                 exit 0
                 ;;
             *) die "Unknown option: $1" ;;
@@ -216,8 +394,14 @@ main() {
         shift
     done
 
+    if $CALIBRATE; then
+        run_calibration
+        exit 0
+    fi
+
     check_deps
     find_backlight
+    load_monitor_config
 
     if $ONCE; then
         sync_brightness
