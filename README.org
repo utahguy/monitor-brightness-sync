@@ -32,6 +32,16 @@ Then *log out and back in* for =i2c= group membership to take effect.
 monitor-brightness-sync --once
 #+end_src
 
+** Calibrate monitors
+
+Some monitors have non-standard DDC/CI brightness ranges (e.g. VCP 0-100 maps to OSD 37-255 instead of 0-100). Run calibration to find the correct VCP range:
+
+#+begin_src sh
+monitor-brightness-sync --calibrate
+#+end_src
+
+This interactively binary-searches for the VCP values that correspond to your monitor's OSD 0 and OSD 100, then saves the result to =~/.config/monitor-brightness-sync/monitors.conf=. Uncalibrated monitors default to the standard 0-100 VCP range.
+
 ** Dry run (see what would happen without changing anything)
 
 #+begin_src sh
@@ -55,11 +65,13 @@ journalctl --user -u monitor-brightness-sync -f
 
 Edit the variables at the top of =monitor-brightness-sync=:
 
-| Variable            | Default | Description                                  |
-|---------------------+---------+----------------------------------------------|
-| =MIN_BRIGHTNESS=    |       0 | Floor for external monitor brightness (0-100) |
-| =MAX_BRIGHTNESS=    |     100 | Cap for external monitor brightness (0-100)   |
-| =MONITOR_CACHE_TTL= |      60 | Seconds to cache monitor detection results     |
+| Variable            | Default | Description                                         |
+|---------------------+---------+-----------------------------------------------------|
+| =DEFAULT_MIN_VCP=   |       0 | Default min VCP value for uncalibrated monitors      |
+| =DEFAULT_MAX_VCP=   |     100 | Default max VCP value for uncalibrated monitors      |
+| =MONITOR_CACHE_TTL= |      60 | Seconds to cache monitor detection results           |
+
+Per-monitor calibration overrides are stored in =~/.config/monitor-brightness-sync/monitors.conf=.
 
 * How it works
 
